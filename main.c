@@ -41,7 +41,7 @@ struct private {
 typedef struct private private_t;
 
 struct hsearch_data *mailfrom_htab = NULL;
-pthread_mutex_t *mailfrom_mutex = NULL;
+pthread_mutex_t mailfrom_mutex;
 
 #define R(a) (flags&FLAG_DRY ? SMFIS_CONTINUE : a)
 
@@ -87,7 +87,7 @@ void mailfrom_add(const char const *mailfrom) {
 	sprintf(query, "INSERT INTO tocheckmilter_mailfrom VALUES(\"%s\")", 
 		mailfrom);
 
-	pthread_mutex_lock(mailfrom_mutex);
+	pthread_mutex_lock(&mailfrom_mutex);
 
 	rc = sqlite3_exec(db, query, NULL, NULL, &errmsg);
 	if(rc != SQLITE_OK) {
@@ -97,19 +97,19 @@ void mailfrom_add(const char const *mailfrom) {
 
 	mailfrom_htab_add(mailfrom);
 
-	pthread_mutex_unlock(mailfrom_mutex);
+	pthread_mutex_unlock(&mailfrom_mutex);
 
 	return;
 }
 
 int mailfrom_chk(const char const *mailfrom) {
-	pthread_mutex_lock(mailfrom_mutex);
+	pthread_mutex_lock(&mailfrom_mutex);
 
 	ENTRY entry, *ret;
 	entry.key = (char *)mailfrom;
 	hsearch_r(entry, FIND, &ret, mailfrom_htab);
 
-	pthread_mutex_unlock(mailfrom_mutex);
+	pthread_mutex_unlock(&mailfrom_mutex);
 
 	if(ret != NULL)
 		return 1;
@@ -388,7 +388,7 @@ int main(int argc, char *argv[]) {
 		fprintf(stderr, "smfi_register() failed\n");
 		exit(EX_UNAVAILABLE);
 	}
-	if(pthread_mutex_init(mailfrom_mutex, NULL)) {
+	if(pthread_mutex_init(&mailfrom_mutex, NULL)) {
 		fprintf(stderr, "pthread_mutex_init() failed\n");
 		exit(EX_SOFTWARE);
 	}
@@ -398,7 +398,7 @@ int main(int argc, char *argv[]) {
 	sqlite3_close(db);
 	closelog();
 	mailfrom_free();
-	pthread_mutex_destroy(mailfrom_mutex);
+	pthread_mutex_destroy(&mailfrom_mutex);
 	return ret;
 }
 
