@@ -16,5 +16,6 @@ options
  - -H - check only HTML letters
  - -N - check mail only from new senders (in "MAIL FROM")
  - -l - limit of domains in "To" field
+ - -d - dry run (don't reject mail)
  - -h - help
 
