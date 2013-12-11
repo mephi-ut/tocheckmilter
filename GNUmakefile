@@ -15,7 +15,7 @@ all: $(objs)
 	$(CC) -std=gnu11 $(CFLAGS) $(INCFLAGS) $< -c -o $@
 
 debug:
-	$(CC) -std=gnu11 $(DEBUGCFLAGS) $(INCFLAGS) $(LDFLAGS) *.c -o to-check-milter-debug
+	$(CC) -std=gnu11 $(DEBUGCFLAGS) $(INCFLAGS) $(LDFLAGS) main.c -o to-check-milter-debug
 
 clean:
 	rm -f to-check-milter to-check-milter-debug $(objs)

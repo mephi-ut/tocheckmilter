@@ -16,7 +16,10 @@
 #include <sqlite3.h>
 #include <pthread.h>
 
-// === TODO ===
+#define HASH_ALLOC
+
+#define MAX_RECIPIENTS 		100
+#define MAX_KNOWNSENDERS	(1 << 20)
 
 // === Global definitions ===
 static sqlite3 *db = NULL;
@@ -28,30 +31,51 @@ enum flags {
 	FLAG_DRY			= 0x04,
 };
 typedef enum flags flags_t;
-flags_t flags = FLAG_EMPTY;
+static flags_t flags = FLAG_EMPTY;
 
-int	todomains_limit = 3;
+static int todomains_limit = 3;
 
 struct private {
+	char			*mailfrom;
 	char 			 mailfrom_isnew;
-	char			 body_havehtml;
+	char			 body_hashtml;
 	int 			 todomains;
-	struct hsearch_data 	*todomain_htab;
+	struct hsearch_data 	 todomain_htab;
+#ifdef HASH_ALLOC
+	char			*todomain[MAX_RECIPIENTS];
+#endif
 };
 typedef struct private private_t;
 
-struct hsearch_data *mailfrom_htab = NULL;
-pthread_mutex_t mailfrom_mutex;
+static struct hsearch_data mailfrom_htab={0};
+static pthread_mutex_t mailfrom_mutex;
+
+#ifdef HASH_ALLOC
+static int   mailfroms = 0;
+static char *mailfrom[MAX_KNOWNSENDERS];
+#endif
 
 #define R(a) (flags&FLAG_DRY ? SMFIS_CONTINUE : a)
 
 // === SQLite3 routines ===
 
-void mailfrom_htab_add(const char const *mailfrom) {
-	ENTRY entry;
-	entry.key  = (char *)mailfrom;
+void mailfrom_htab_add(const char const *mailfrom_in) {
+#ifdef HASH_ALLOC
+	char *mailfrom_cur = strdup(mailfrom_in);
+	mailfrom[mailfroms++] = mailfrom_cur;
+#else
+	char *mailfrom_cur = *mailfrom_in;
+#endif
+
+	ENTRY entry, *ret;
+	entry.key  = (char *)mailfrom_cur;
 	entry.data = (void *)1;
-	hsearch_r(entry, ENTER, NULL, mailfrom_htab);
+	if(!hsearch_r(entry, ENTER, &ret, &mailfrom_htab)) {
+		syslog(LOG_CRIT, "mailfrom_htab_add(): Cannot insert new \"MAIL FROM\" entry (too small MAX_KNOWNSENDERS?): %s (errno: %i). Exit.\n",
+			strerror(errno), errno);
+		exit(EX_SOFTWARE);
+	}
+	syslog(LOG_NOTICE, "mailfrom_htab_add(): \"%s\".\n", mailfrom_cur);
 
 	return;
 }
@@ -71,10 +95,16 @@ void mailfrom_get() {
 	char query[BUFSIZ];
 	int rc;
 	char *errmsg = NULL;
+
+	if(!hcreate_r(MAX_KNOWNSENDERS, &mailfrom_htab)) {
+		syslog(LOG_CRIT, "mailfrom_get(): Failure on hcreate_r(): %s (errno: %i). Exit.\n", strerror(errno), errno);
+		exit(EX_SOFTWARE);
+	}
+
 	sprintf(query, "SELECT mailfrom FROM tocheckmilter_mailfrom");
 	rc = sqlite3_exec(db, query, (int (*)(void *, int,  char **, char **))mailfrom_get_callback, NULL, &errmsg);
 	if(rc != SQLITE_OK) {
-		syslog(LOG_CRIT, "Cannot get statistics from DB: %s. Exit.\n", errmsg);
+		syslog(LOG_CRIT, "Cannot get valid \"MAIL FROM\" history from DB: %s. Exit.\n", errmsg);
 		exit(EX_SOFTWARE);
 	}
 	return;
@@ -91,8 +121,8 @@ void mailfrom_add(const char const *mailfrom) {
 
 	rc = sqlite3_exec(db, query, NULL, NULL, &errmsg);
 	if(rc != SQLITE_OK) {
-		syslog(LOG_CRIT, "Cannot update statistics in DB: %s. Exit.\n", errmsg);
-		exit(EX_SOFTWARE);
+		syslog(LOG_CRIT, "Cannot insert new \"MAIL FROM\" into history in DB: %s. Ignoring.\n", errmsg);
+//		exit(EX_SOFTWARE);
 	}
 
 	mailfrom_htab_add(mailfrom);
@@ -106,20 +136,26 @@ int mailfrom_chk(const char const *mailfrom) {
 	pthread_mutex_lock(&mailfrom_mutex);
 
 	ENTRY entry, *ret;
-	entry.key = (char *)mailfrom;
-	hsearch_r(entry, FIND, &ret, mailfrom_htab);
+	entry.key  = (char *)mailfrom;
+	entry.data = (void *)1;
+	hsearch_r(entry, FIND, &ret, &mailfrom_htab);
 
 	pthread_mutex_unlock(&mailfrom_mutex);
 
 	if(ret != NULL)
 		return 1;
 
+	syslog(LOG_NOTICE, "mailfrom_chk(): Cannot find \"%s\".\n", mailfrom);
 	return 0;
 }
 
 void mailfrom_free() {
-	hdestroy_r(mailfrom_htab);
+	hdestroy_r(&mailfrom_htab);
 
+#ifdef HASH_ALLOC
+	while(mailfroms--)
+		free(mailfrom[mailfroms]);
+#endif
 	return;
 }
 
@@ -130,9 +166,16 @@ extern sfsistat tockmilter_cleanup(SMFICTX *, bool);
 sfsistat tockmilter_connect(SMFICTX *ctx, char *hostname, _SOCK_ADDR *hostaddr) {
 	private_t *private_p = calloc(1, sizeof(private_t));
 	if(private_p == NULL) {
-		syslog(LOG_NOTICE, "tockmilter_envfrom(): Cannot allocate memory. Exit.\n");
+		syslog(LOG_NOTICE, "tockmilter_connect(): Cannot allocate memory. Exit.\n");
 		exit(EX_SOFTWARE);
 	}
+
+	if(!hcreate_r(MAX_RECIPIENTS+2, &private_p->todomain_htab)) {
+		syslog(LOG_NOTICE, "tockmilter_connect(): Failure on hcreate_r(). Exit.\n");
+		exit(EX_SOFTWARE);
+	}
+
+	smfi_setpriv(ctx, private_p);
 
 	return SMFIS_CONTINUE;
 }
@@ -142,20 +185,20 @@ sfsistat tockmilter_helo(SMFICTX *ctx, char *helohost) {
 }
 
 sfsistat tockmilter_envfrom(SMFICTX *ctx, char **argv) {
-	if(flags & FLAG_CHECK_NEWSENDERSONLY) {
-		if(argv[0] == NULL) {
-			syslog(LOG_NOTICE, "%s: tockmilter_envfrom(): argv[0]==NULL. Sending TEMPFAIL.\n", smfi_getsymval(ctx, "i"));
-			return R(SMFIS_TEMPFAIL);
-		}
-		if(*argv[0] == 0) {
-			syslog(LOG_NOTICE, "%s: tockmilter_envfrom(): *argv[0]==0. Sending TEMPFAIL.\n", smfi_getsymval(ctx, "i"));
-			return R(SMFIS_TEMPFAIL);
-		}
 
-		private_t *private_p = smfi_getpriv(ctx);
-
-		private_p->mailfrom_isnew = !mailfrom_chk(argv[0]);
+	if(argv[0] == NULL) {
+		syslog(LOG_NOTICE, "%s: tockmilter_envfrom(): argv[0]==NULL. Sending TEMPFAIL.\n", smfi_getsymval(ctx, "i"));
+		return R(SMFIS_TEMPFAIL);
 	}
+	if(*argv[0] == 0) {
+		syslog(LOG_NOTICE, "%s: tockmilter_envfrom(): *argv[0]==0. Sending TEMPFAIL.\n", smfi_getsymval(ctx, "i"));
+		return R(SMFIS_TEMPFAIL);
+	}
+
+	private_t *private_p = smfi_getpriv(ctx);
+
+	private_p->mailfrom  = strdup(argv[0]);
+	private_p->mailfrom_isnew = !mailfrom_chk(argv[0]);
 
 	return SMFIS_CONTINUE;
 }
@@ -164,30 +207,42 @@ sfsistat tockmilter_envrcpt(SMFICTX *ctx, char **argv) {
 	return SMFIS_CONTINUE;
 }
 
-sfsistat tockmilter_header(SMFICTX *ctx, char *headerf, char *headerv) {
+sfsistat tockmilter_header(SMFICTX *ctx, char *headerf, char *_headerv) {
 	if(!strcasecmp(headerf, "To")) {
 
 		private_t *private_p = smfi_getpriv(ctx);
+		if(private_p == NULL) {
+			syslog(LOG_NOTICE, "%s: tockmilter_header(): private_p == NULL. Skipping.\n", smfi_getsymval(ctx, "i"));
+			return SMFIS_CONTINUE;
+		}
 
 		if(flags & FLAG_CHECK_NEWSENDERSONLY) 
 			if(!private_p->mailfrom_isnew)
 				return SMFIS_CONTINUE;
 
 		char *at_saveptr = NULL;
-		while(1) {
-			char *at = strtok_r(headerv, "@", &at_saveptr);
+		char *headerv = strdup(_headerv);
+		strtok_r(headerv, "@", &at_saveptr);
+		do {
+
+			char *at = strtok_r(NULL, "@", &at_saveptr);
 
 			if(at == NULL)
 				break;
 
 			char *domainend_saveptr = NULL;
-			char *domainend = strtok_r(at, " \n\t)(<>@,;:\"/[]?=", &domainend_saveptr);
+			strtok_r(&at[1], " \n\t)(<>@,;:\"/[]?=", &domainend_saveptr);
+			char *domainend = strtok_r(NULL, " \n\t)(<>@,;:\"/[]?=", &domainend_saveptr);
 
 			if(domainend == NULL)
 				break;
 
-			char *domain=alloca(domainend - at + 1);
-			memcpy(domain, &at[1], domainend-at);
+#ifdef HASH_ALLOC
+			char *domain = malloc(domainend - at + 9);
+#else
+			char *domain = alloca(domainend - at + 9);
+#endif
+			memcpy(domain, at, domainend-at);
 			domain[domainend-at] = 0;
 
 			syslog(LOG_NOTICE, "%s: tockmilter_header(): todomain: %s.\n", smfi_getsymval(ctx, "i"), domain);
@@ -197,11 +252,20 @@ sfsistat tockmilter_header(SMFICTX *ctx, char *headerf, char *headerv) {
 			entry.key  = domain;
 			entry.data = (void *)1;
 
-			hsearch_r(entry, ENTER, &ret, private_p->todomain_htab);
+			hsearch_r(entry, FIND, &ret, &private_p->todomain_htab);
 
-			if(ret == NULL)
+			if(ret == NULL) {
+				hsearch_r(entry, ENTER, &ret, &private_p->todomain_htab);
+#ifndef HASH_ALLOC
 				private_p->todomains++;
-		}
+			}
+#else
+				private_p->todomain[private_p->todomains++] = domain;
+			} else
+				free(domain);
+#endif
+		} while(private_p->todomains < MAX_RECIPIENTS);
+		free(headerv);
 	}
 	return SMFIS_CONTINUE;
 }
@@ -216,32 +280,44 @@ sfsistat tockmilter_body(SMFICTX *ctx, unsigned char *bodyp, size_t bodylen) {
 
 	private_t *private_p = smfi_getpriv(ctx);
 	if(strstr((char *)bodyp, "\nContent-Type: text/html")) {
-		private_p->body_havehtml = 1;
+		private_p->body_hashtml = 1;
 		syslog(LOG_NOTICE, "%s: tockmilter_body(): Seems, that here's HTML included.\n", smfi_getsymval(ctx, "i"));
 	}
 	return SMFIS_CONTINUE;
 }
 
+static inline int tockmilter_eom_ok(SMFICTX *ctx, private_t *private_p) {
+	smfi_addheader(ctx, "X-ToChk-Milter", "passed");
+	if(private_p->mailfrom_isnew)
+		mailfrom_add(private_p->mailfrom);
+	return SMFIS_CONTINUE;
+}
+
 sfsistat tockmilter_eom(SMFICTX *ctx) {
 	private_t *private_p = smfi_getpriv(ctx);
+	if(private_p == NULL) {
+		syslog(LOG_NOTICE, "%s: tockmilter_eom(): private_p == NULL. Skipping.\n", smfi_getsymval(ctx, "i"));
+		return SMFIS_CONTINUE;
+	}
+
+	syslog(LOG_NOTICE, "%s: tockmilter_eom(): Total: mailfrom_isnew == %u; to_domains == %u, body_hashtml == %u.\n", 
+		smfi_getsymval(ctx, "i"), private_p->mailfrom_isnew, private_p->todomains, private_p->body_hashtml);
 
 	if(flags & FLAG_CHECK_NEWSENDERSONLY) 
-		if(!private_p->mailfrom_isnew)
-			return SMFIS_CONTINUE;
+		if(!private_p->mailfrom_isnew) 
+			return tockmilter_eom_ok(ctx, private_p);
 
 	if(flags & FLAG_CHECK_HTMLMAILONLY)
-		if(!private_p->body_havehtml)
-			return SMFIS_CONTINUE;
+		if(!private_p->body_hashtml)
+			return tockmilter_eom_ok(ctx, private_p);
 
 	if(private_p->todomains > todomains_limit) {
-
 		syslog(LOG_NOTICE, "%s: tockmilter_eom(): Too many domains in \"To\" field: %u > %u. Sending SMFIS_REJECT.\n", 
 			smfi_getsymval(ctx, "i"), private_p->todomains, todomains_limit);
 		return R(SMFIS_REJECT);
 	}
 
-	smfi_addheader(ctx, "X-ToChk-Milter", "passed");
-	return SMFIS_CONTINUE;
+	return tockmilter_eom_ok(ctx, private_p);
 }
 
 sfsistat tockmilter_abort(SMFICTX *ctx) {
@@ -250,10 +326,20 @@ sfsistat tockmilter_abort(SMFICTX *ctx) {
 
 sfsistat tockmilter_close(SMFICTX *ctx) {
 	private_t *private_p = smfi_getpriv(ctx);
-	if(private_p != NULL) {
-		free(private_p);
-		smfi_setpriv(ctx, NULL);
+	if(private_p == NULL) {
+		syslog(LOG_NOTICE, "%s: tockmilter_close(): private_p == NULL. Skipping.\n", smfi_getsymval(ctx, "i"));
+		return SMFIS_CONTINUE;
 	}
+
+	hdestroy_r(&private_p->todomain_htab);
+#ifdef HASH_ALLOC
+	while(private_p->todomains--) {
+		free(private_p->todomain[private_p->todomains]);
+	}
+#endif
+	free(private_p->mailfrom);
+	free(private_p);
+	smfi_setpriv(ctx, NULL);
 
 	return SMFIS_CONTINUE;
 }
@@ -367,6 +453,7 @@ int main(int argc, char *argv[]) {
 					fprintf(stderr, "Invalid DB file \"%s\". Recreating table \"tocheckmilter_mailfrom\" in it.\n", optarg);
 					sqlite3_exec(db, "DROP TABLE tocheckmilter_mailfrom", NULL, NULL, NULL);
 					sqlite3_exec(db, "CREATE TABLE tocheckmilter_mailfrom (mailfrom VARCHAR(255))", NULL, NULL, NULL);
+					sqlite3_exec(db, "CREATE UNIQUE INDEX mailfrom_idx ON tocheckmilter_mailfrom (mailfrom)", NULL, NULL, NULL);
 				}
 				sqlite3_finalize(stmt);
 				break;
