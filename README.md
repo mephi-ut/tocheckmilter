@@ -17,5 +17,7 @@ options
  - -N - check mail only from new senders (in "MAIL FROM")
  - -l - limit of domains in "To" field
  - -d - dry run (don't reject mail)
+ - -B - check mail from blacklisted senders only (blacklisting status is
+detected by "X-DNSBL-MILTER" header value left by [dnsbl-milter](https://github.com/hloeung/dnsbl-milter "dnsbl-milter"))
  - -h - help
 

@@ -383,7 +383,7 @@ sfsistat tockmilter_negotiate(ctx, f0, f1, f2, f3, pf0, pf1, pf2, pf3)
 }
 
 static void usage(const char *path) {
-	fprintf(stderr, "Usage: %s -p socket-addr [-t timeout] [-L domain limit] [-N /path/to/sqlite/db] [-Hd]\n",
+	fprintf(stderr, "Usage: %s -p socket-addr [-t timeout] [-L domain limit] [-N /path/to/sqlite/db] [-HdB]\n",
 		path);
 }
 
