@@ -28,7 +28,8 @@ enum flags {
 	FLAG_EMPTY			= 0x00,
 	FLAG_CHECK_HTMLMAILONLY		= 0x01,
 	FLAG_CHECK_NEWSENDERSONLY	= 0x02,
-	FLAG_DRY			= 0x04,
+	FLAG_CHECK_BLONLY		= 0x04,
+	FLAG_DRY			= 0x10,
 };
 typedef enum flags flags_t;
 static flags_t flags = FLAG_EMPTY;
@@ -38,6 +39,7 @@ static int todomains_limit = 3;
 struct private {
 	char			*mailfrom;
 	char 			 mailfrom_isnew;
+	char			 sender_blacklisted;
 	char			 body_hashtml;
 	int 			 todomains;
 	struct hsearch_data 	 todomain_htab;
@@ -208,6 +210,8 @@ sfsistat tockmilter_envrcpt(SMFICTX *ctx, char **argv) {
 }
 
 sfsistat tockmilter_header(SMFICTX *ctx, char *headerf, char *_headerv) {
+//	syslog(LOG_NOTICE, "%s: tockmilter_header(): \"%s\": \"%s\".\n", smfi_getsymval(ctx, "i"), headerf, _headerv);
+
 	if(!strcasecmp(headerf, "To")) {
 
 		private_t *private_p = smfi_getpriv(ctx);
@@ -266,6 +270,14 @@ sfsistat tockmilter_header(SMFICTX *ctx, char *headerf, char *_headerv) {
 #endif
 		} while(private_p->todomains < MAX_RECIPIENTS);
 		free(headerv);
+	} else
+	if(!strcasecmp(headerf, "X-DNSBL-MILTER")) {
+		private_t *private_p = smfi_getpriv(ctx);
+		if(!strcasecmp(_headerv, "Blacklisted")) {
+			private_p->sender_blacklisted = 1;
+		}
+		syslog(LOG_NOTICE, "%s: tockmilter_header(): Found DNSBL header value: %s. Blacklisted: %u.\n",
+			smfi_getsymval(ctx, "i"), _headerv, private_p->sender_blacklisted);
 	}
 	return SMFIS_CONTINUE;
 }
@@ -300,8 +312,8 @@ sfsistat tockmilter_eom(SMFICTX *ctx) {
 		return SMFIS_CONTINUE;
 	}
 
-	syslog(LOG_NOTICE, "%s: tockmilter_eom(): Total: mailfrom_isnew == %u; to_domains == %u, body_hashtml == %u.\n", 
-		smfi_getsymval(ctx, "i"), private_p->mailfrom_isnew, private_p->todomains, private_p->body_hashtml);
+	syslog(LOG_NOTICE, "%s: tockmilter_eom(): Total: mailfrom_isnew == %u; to_domains == %u, body_hashtml == %u, sender_blacklisted == %u.\n", 
+		smfi_getsymval(ctx, "i"), private_p->mailfrom_isnew, private_p->todomains, private_p->body_hashtml, private_p->sender_blacklisted);
 
 	if(flags & FLAG_CHECK_NEWSENDERSONLY) 
 		if(!private_p->mailfrom_isnew) 
@@ -309,6 +321,10 @@ sfsistat tockmilter_eom(SMFICTX *ctx) {
 
 	if(flags & FLAG_CHECK_HTMLMAILONLY)
 		if(!private_p->body_hashtml)
+			return tockmilter_eom_ok(ctx, private_p);
+
+	if(flags & FLAG_CHECK_BLONLY)
+		if(!private_p->sender_blacklisted)
 			return tockmilter_eom_ok(ctx, private_p);
 
 	if(private_p->todomains > todomains_limit) {
@@ -393,7 +409,7 @@ int main(int argc, char *argv[]) {
 
 	char setconn = 0;
 	int c;
-	const char *args = "p:t:hHdN:L:";
+	const char *args = "p:t:hHdN:L:B";
 	extern char *optarg;
 	// Process command line options
 	while ((c = getopt(argc, argv, args)) != -1) {
@@ -435,6 +451,9 @@ int main(int argc, char *argv[]) {
 				break;
 			case 'H':
 				flags |= FLAG_CHECK_HTMLMAILONLY;
+				break;
+			case 'B':
+				flags |= FLAG_CHECK_BLONLY;
 				break;
 			case 'N':
                                 // Openning the DB
