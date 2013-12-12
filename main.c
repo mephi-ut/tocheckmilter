@@ -287,8 +287,10 @@ sfsistat tockmilter_eoh(SMFICTX *ctx) {
 }
 
 sfsistat tockmilter_body(SMFICTX *ctx, unsigned char *bodyp, size_t bodylen) {
-	if(flags & FLAG_CHECK_HTMLMAILONLY)
+	if(!(flags & FLAG_CHECK_HTMLMAILONLY))
 		return SMFIS_CONTINUE;
+
+//	syslog(LOG_NOTICE, "%s: tockmilter_body(): \"%s\".\n", smfi_getsymval(ctx, "i"), bodyp);
 
 	private_t *private_p = smfi_getpriv(ctx);
 	if(strstr((char *)bodyp, "\nContent-Type: text/html")) {
