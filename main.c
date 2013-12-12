@@ -103,6 +103,13 @@ void mailfrom_get() {
 		exit(EX_SOFTWARE);
 	}
 
+	sprintf(query, "DELETE FROM tocheckmilter_mailfrom WHERE dom < strftime('%%s', 'now')-(3600*24*365)");
+	rc = sqlite3_exec(db, query, (int (*)(void *, int,  char **, char **))mailfrom_get_callback, NULL, &errmsg);
+	if(rc != SQLITE_OK) {
+		syslog(LOG_CRIT, "Cannot delete expired \"MAIL FROM\" from history in DB: %s. Exit.\n", errmsg);
+		exit(EX_SOFTWARE);
+	}
+
 	sprintf(query, "SELECT mailfrom FROM tocheckmilter_mailfrom");
 	rc = sqlite3_exec(db, query, (int (*)(void *, int,  char **, char **))mailfrom_get_callback, NULL, &errmsg);
 	if(rc != SQLITE_OK) {
@@ -112,11 +119,31 @@ void mailfrom_get() {
 	return;
 }
 
+void mailfrom_upd(const char const *mailfrom) {
+	char query[BUFSIZ];
+	int rc;
+	char *errmsg = NULL;
+	sprintf(query, "UPDATE tocheckmilter_mailfrom SET count=count+1, dom=CURRENT_TIMESTAMP WHERE mailfrom=\"%s\"", 
+		mailfrom);
+
+	pthread_mutex_lock(&mailfrom_mutex);
+
+	rc = sqlite3_exec(db, query, NULL, NULL, &errmsg);
+	if(rc != SQLITE_OK) {
+		syslog(LOG_CRIT, "Cannot update \"MAIL FROM\" in history in DB: %s. Ignoring.\n", errmsg);
+//		exit(EX_SOFTWARE);
+	}
+
+	pthread_mutex_unlock(&mailfrom_mutex);
+
+	return;
+}
+
 void mailfrom_add(const char const *mailfrom) {
 	char query[BUFSIZ];
 	int rc;
 	char *errmsg = NULL;
-	sprintf(query, "INSERT INTO tocheckmilter_mailfrom VALUES(\"%s\")", 
+	sprintf(query, "INSERT INTO tocheckmilter_mailfrom VALUES(\"%s\", CURRENT_TIMESTAMP, 1)", 
 		mailfrom);
 
 	pthread_mutex_lock(&mailfrom_mutex);
@@ -304,6 +331,8 @@ static inline int tockmilter_eom_ok(SMFICTX *ctx, private_t *private_p) {
 	smfi_addheader(ctx, "X-ToChk-Milter", "passed");
 	if(private_p->mailfrom_isnew)
 		mailfrom_add(private_p->mailfrom);
+	else
+		mailfrom_upd(private_p->mailfrom);
 	return SMFIS_CONTINUE;
 }
 
@@ -468,13 +497,14 @@ int main(int argc, char *argv[]) {
 				// Checking it's validness. Fixing if required.
 				int rc;
 				sqlite3_stmt *stmt = NULL;
-				rc = sqlite3_prepare_v2(db, "SELECT mailfrom FROM tocheckmilter_mailfrom LIMIT 1", -1, &stmt, NULL);
+				rc = sqlite3_prepare_v2(db, "SELECT mailfrom, dom, count FROM tocheckmilter_mailfrom LIMIT 1", -1, &stmt, NULL);
 				if(rc != SQLITE_OK) {
 					// Fixing the table "statmilter_stats"
 					fprintf(stderr, "Invalid DB file \"%s\". Recreating table \"tocheckmilter_mailfrom\" in it.\n", optarg);
 					sqlite3_exec(db, "DROP TABLE tocheckmilter_mailfrom", NULL, NULL, NULL);
-					sqlite3_exec(db, "CREATE TABLE tocheckmilter_mailfrom (mailfrom VARCHAR(255))", NULL, NULL, NULL);
+					sqlite3_exec(db, "CREATE TABLE tocheckmilter_mailfrom (mailfrom VARCHAR(255), dom timestamp DEFAULT CURRENT_TIMESTAMP, count integer(8) DEFAULT 0)", NULL, NULL, NULL);
 					sqlite3_exec(db, "CREATE UNIQUE INDEX mailfrom_idx ON tocheckmilter_mailfrom (mailfrom)", NULL, NULL, NULL);
+					sqlite3_exec(db, "CREATE INDEX dom_idx ON tocheckmilter_mailfrom (dom)", NULL, NULL, NULL);
 				}
 				sqlite3_finalize(stmt);
 				break;
